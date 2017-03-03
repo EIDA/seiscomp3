@@ -5,6 +5,8 @@
 # (C) 2014-2016 Helmholtz-Zentrum Potsdam - Deutsches GeoForschungsZentrum GFZ#
 #                                                                             #
 # License: LGPLv3 (https://www.gnu.org/copyleft/lesser.html)                  #
+#                                                                             #
+# modified by Fabian Euchner, ETHZ                                            #
 ###############################################################################
 
 """
@@ -70,6 +72,7 @@ import threading
 import socket
 import csv
 import re
+import struct
 
 try:
     # Python 3.2 and earlier
@@ -92,7 +95,7 @@ except ImportError:
     import urllib.parse as urlparse
     import urllib.parse as urllib
 
-VERSION = "2016.140"
+VERSION = "2017.060"
 
 GET_PARAMS = set(('net', 'network',
                   'sta', 'station',
@@ -105,6 +108,22 @@ GET_PARAMS = set(('net', 'network',
 
 POST_PARAMS = set(('service',
                    'alternative'))
+
+STATIONXML_RESOURCE_METADATA_ELEMENTS = (
+    '{http://www.fdsn.org/xml/station/1}Source',
+    '{http://www.fdsn.org/xml/station/1}Created',
+    '{http://www.fdsn.org/xml/station/1}Sender',
+    '{http://www.fdsn.org/xml/station/1}Module',
+    '{http://www.fdsn.org/xml/station/1}ModuleURI')
+
+STATION_RESPONSE_TEXT_HEADER = \
+    '#Network|Station|Latitude|Longitude|Elevation|SiteName|StartTime|EndTime'
+
+FIXED_DATA_HEADER_SIZE = 48
+DATA_ONLY_BLOCKETTE_SIZE = 8
+
+DATA_ONLY_BLOCKETTE_NUMBER = 1000
+MINIMUM_RECORD_LENGTH = 256
 
 
 class Error(Exception):
@@ -199,6 +218,21 @@ class RoutingURL(object):
         return [(p, v) for (p, v) in self.__qp.items() if p not in GET_PARAMS]
 
 
+class TextCombiner(object):
+    def __init__(self):
+        self.__text = ''
+
+    def combine(self, text):
+        if self.__text:
+            self.__text = ''.join((self.__text, text))
+        else:
+            self.__text = '\n'.join((STATION_RESPONSE_TEXT_HEADER, text))
+
+    def dump(self, fd):
+        if self.__text:
+            fd.write(self.__text)
+
+
 class XMLCombiner(object):
     def __init__(self):
         self.__et = None
@@ -215,6 +249,12 @@ class XMLCombiner(object):
                 pass
 
         for el in other:
+
+            # skip Sender, Source, Module, ModuleURI, Created elements of
+            # subsequent trees
+            if el.tag in STATIONXML_RESOURCE_METADATA_ELEMENTS:
+                continue
+
             try:
                 eid = (el.tag, el.attrib['code'], el.attrib['start'])
 
@@ -234,6 +274,28 @@ class XMLCombiner(object):
 
         else:
             self.__et = ET.parse(fd)
+            root = self.__et.getroot()
+
+            # Note: this assumes well-formed StationXML
+            # first StationXML tree: modify Source, Created
+            try:
+                source = root.find(STATIONXML_RESOURCE_METADATA_ELEMENTS[0])
+                source.text = 'FDSNWS'
+            except Exception:
+                pass
+
+            try:
+                created = root.find(STATIONXML_RESOURCE_METADATA_ELEMENTS[1])
+                created.text = datetime.datetime.utcnow().strftime(
+                    '%Y-%m-%dT%H:%M:%S')
+            except Exception:
+                pass
+
+            # remove Sender, Module, ModuleURI
+            for tag in STATIONXML_RESOURCE_METADATA_ELEMENTS[2:]:
+                el = root.find(tag)
+                if el is not None:
+                    root.remove(el)
 
     def dump(self, fd):
         if self.__et:
@@ -458,7 +520,7 @@ def retry(urlopen, url, data, timeout, count, wait, verbose):
             time.sleep(wait)
 
 
-def fetch(url, cred, authdata, postlines, xc, dest, timeout, retry_count,
+def fetch(url, cred, authdata, postlines, xc, tc, dest, timeout, retry_count,
           retry_wait, finished, lock, verbose):
     try:
         url_handlers = []
@@ -589,28 +651,147 @@ def fetch(url, cred, authdata, postlines, xc, dest, timeout, retry_count,
                         content_type = content_type.split(';')[0]
 
                         if content_type == "application/vnd.fdsn.mseed":
-                            while True:
-                                buf = fd.read(4096)
 
+                            record_idx = 1
+
+                            # NOTE: cannot use fixed chunk size, because
+                            # response from single node mixes mseed record
+                            # sizes. E.g., a 4096 byte chunk could contain 7
+                            # 512 byte records and the first 512 bytes of a
+                            # 4096 byte record, which would not be completed
+                            # in the same write operation
+                            while True:
+
+                                # read fixed header
+                                buf = fd.read(FIXED_DATA_HEADER_SIZE)
                                 if not buf:
                                     break
 
-                                with lock:
-                                    dest.write(buf)
+                                record = buf
+                                curr_size = len(buf)
 
-                                size += len(buf)
+                                # get offset of data (value before last,
+                                # 2 bytes, unsigned short)
+                                data_offset_idx = FIXED_DATA_HEADER_SIZE - 4
+                                data_offset, = struct.unpack(
+                                    '!H',
+                                    buf[data_offset_idx:data_offset_idx+2])
+
+                                if data_offset >= FIXED_DATA_HEADER_SIZE:
+                                    remaining_header_size = data_offset - \
+                                        FIXED_DATA_HEADER_SIZE
+
+                                elif data_offset == 0 :
+                                    # This means that blockettes can follow,
+                                    # but no data samples. Use minimum record
+                                    # size to read following blockettes. This
+                                    # can still fail if blockette 1000 is after
+                                    # position 256
+                                    remaining_header_size = \
+                                        MINIMUM_RECORD_LENGTH - \
+                                            FIXED_DATA_HEADER_SIZE
+
+                                else:
+                                    # Full header size cannot be smaller than
+                                    # fixed header size. This is an error.
+                                    msg("record %s: data offset smaller than "\
+                                        "fixed header length: %s, bailing "\
+                                        "out" % (record_idx, data_offset))
+                                    break
+
+                                buf = fd.read(remaining_header_size)
+                                if not buf:
+                                    msg("remaining header corrupt in record "\
+                                        "%s" % record_idx)
+                                    break
+
+                                record += buf
+                                curr_size += len(buf)
+
+                                # scan variable header for blockette 1000
+                                blockette_start = 0
+                                b1000_found = False
+
+                                while (blockette_start < remaining_header_size):
+
+                                    # 2 bytes, unsigned short
+                                    blockette_id, = struct.unpack(
+                                        '!H',
+                                        buf[blockette_start:blockette_start+2])
+
+                                    # get start of next blockette (second
+                                    # value, 2 bytes, unsigned short)
+                                    next_blockette_start, = struct.unpack(
+                                        '!H',
+                                        buf[blockette_start+2:blockette_start+4])
+
+                                    if blockette_id == \
+                                        DATA_ONLY_BLOCKETTE_NUMBER:
+
+                                        b1000_found = True
+                                        break
+
+                                    elif next_blockette_start == 0:
+                                        # no blockettes follow
+                                        msg("record %s: no blockettes follow "\
+                                            "after blockette %s at pos %s" % (
+                                            record_idx, blockette_id,
+                                            blockette_start))
+                                        break
+
+                                    else:
+                                        blockette_start = next_blockette_start
+
+                                # blockette 1000 not found
+                                if not b1000_found:
+                                    msg("record %s: blockette 1000 not found,"\
+                                        " stop reading" % record_idx)
+                                    break
+
+                                # get record size (1 byte, unsigned char)
+                                record_size_exponent_idx = blockette_start + 6
+                                record_size_exponent, = struct.unpack(
+                                    '!B',
+                                    buf[record_size_exponent_idx:\
+                                    record_size_exponent_idx+1])
+
+                                remaining_record_size = \
+                                    2**record_size_exponent - curr_size
+
+                                # read remainder of record (data section)
+                                buf = fd.read(remaining_record_size)
+                                if not buf:
+                                    msg("cannot read data section of record "\
+                                        "%s" % record_idx)
+                                    break
+
+                                record += buf
+                                with lock:
+                                    dest.write(record)
+
+                                size += len(record)
+                                record_idx += 1
 
                         elif content_type == "text/plain":
+
+                            # this is the station service in text format
+                            output = ''
                             while True:
                                 buf = fd.readline()
 
                                 if not buf:
                                     break
 
-                                with lock:
-                                    dest.write(buf)
+                                # skip header lines that start with '#'
+                                # Note: first header line is inserted in
+                                # TextCombiner class
+                                if buf.startswith('#'):
+                                    continue
 
+                                output = ''.join((output, buf))
                                 size += len(buf)
+
+                            tc.combine(output)
 
                         elif content_type == "application/xml":
                             fdread = fd.read
@@ -670,6 +851,7 @@ def route(url, cred, authdata, postdata, dest, timeout, retry_count,
     finished = Queue.Queue()
     lock = threading.Lock()
     xc = XMLCombiner()
+    tc = TextCombiner()
 
     if postdata:
         query_url = url.post()
@@ -720,6 +902,7 @@ def route(url, cred, authdata, postdata, dest, timeout, retry_count,
                                                                   authdata,
                                                                   postlines,
                                                                   xc,
+                                                                  tc,
                                                                   dest,
                                                                   timeout,
                                                                   retry_count,
@@ -758,6 +941,7 @@ def route(url, cred, authdata, postdata, dest, timeout, retry_count,
         running -= 1
 
     xc.dump(dest)
+    tc.dump(dest)
 
 
 def main():
