@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 ###############################################################################
-# (C) 2014-2016 Helmholtz-Zentrum Potsdam - Deutsches GeoForschungsZentrum GFZ#
+# (C) 2014-2017 Helmholtz-Zentrum Potsdam - Deutsches GeoForschungsZentrum GFZ#
 #                                                                             #
 # License: LGPLv3 (https://www.gnu.org/copyleft/lesser.html)                  #
 #                                                                             #
@@ -73,6 +73,8 @@ import socket
 import csv
 import re
 import struct
+import io
+import dateutil.parser
 
 try:
     # Python 3.2 and earlier
@@ -95,7 +97,7 @@ except ImportError:
     import urllib.parse as urlparse
     import urllib.parse as urllib
 
-VERSION = "2017.060"
+VERSION = "2017.062"
 
 GET_PARAMS = set(('net', 'network',
                   'sta', 'station',
@@ -115,9 +117,6 @@ STATIONXML_RESOURCE_METADATA_ELEMENTS = (
     '{http://www.fdsn.org/xml/station/1}Sender',
     '{http://www.fdsn.org/xml/station/1}Module',
     '{http://www.fdsn.org/xml/station/1}ModuleURI')
-
-STATION_RESPONSE_TEXT_HEADER = \
-    '#Network|Station|Latitude|Longitude|Elevation|SiteName|StartTime|EndTime'
 
 FIXED_DATA_HEADER_SIZE = 48
 DATA_ONLY_BLOCKETTE_SIZE = 8
@@ -220,17 +219,18 @@ class RoutingURL(object):
 
 class TextCombiner(object):
     def __init__(self):
-        self.__text = ''
+        self.__header = bytes()
+        self.__text = bytes()
+
+    def set_header(self, text):
+        self.__header = text
 
     def combine(self, text):
-        if self.__text:
-            self.__text = ''.join((self.__text, text))
-        else:
-            self.__text = '\n'.join((STATION_RESPONSE_TEXT_HEADER, text))
+        self.__text += text
 
     def dump(self, fd):
         if self.__text:
-            fd.write(self.__text)
+            fd.write(self.__header + self.__text)
 
 
 class XMLCombiner(object):
@@ -268,12 +268,12 @@ class XMLCombiner(object):
             except KeyError:
                 one.append(el)
 
-    def combine(self, fd):
+    def combine(self, et):
         if self.__et:
-            self.__combine_element(self.__et.getroot(), ET.parse(fd).getroot())
+            self.__combine_element(self.__et.getroot(), et.getroot())
 
         else:
-            self.__et = ET.parse(fd)
+            self.__et = et
             root = self.__et.getroot()
 
             # Note: this assumes well-formed StationXML
@@ -520,8 +520,8 @@ def retry(urlopen, url, data, timeout, count, wait, verbose):
             time.sleep(wait)
 
 
-def fetch(url, cred, authdata, postlines, xc, tc, dest, timeout, retry_count,
-          retry_wait, finished, lock, verbose):
+def fetch(url, cred, authdata, postlines, xc, tc, dest, nets, timeout,
+          retry_count, retry_wait, finished, lock, verbose):
     try:
         url_handlers = []
 
@@ -766,7 +766,19 @@ def fetch(url, cred, authdata, postlines, xc, tc, dest, timeout, retry_count,
                                     break
 
                                 record += buf
+
+                                # collect network IDs
+                                try:
+                                    netcode = record[18:20].decode('ascii')
+
+                                except UnicodeDecodeError:
+                                    msg("invalid network code")
+                                    break
+
+                                year, = struct.unpack('!H', record[20:22])
+
                                 with lock:
+                                    nets.add((netcode, year))
                                     dest.write(record)
 
                                 size += len(record)
@@ -775,23 +787,24 @@ def fetch(url, cred, authdata, postlines, xc, tc, dest, timeout, retry_count,
                         elif content_type == "text/plain":
 
                             # this is the station service in text format
-                            output = ''
+                            text = bytes()
+
                             while True:
                                 buf = fd.readline()
 
                                 if not buf:
                                     break
 
-                                # skip header lines that start with '#'
-                                # Note: first header line is inserted in
-                                # TextCombiner class
-                                if buf.startswith('#'):
-                                    continue
+                                if buf.startswith(b'#'):
+                                    tc.set_header(buf)
 
-                                output = ''.join((output, buf))
+                                else:
+                                    text += buf
+
                                 size += len(buf)
 
-                            tc.combine(output)
+                            with lock:
+                                tc.combine(text)
 
                         elif content_type == "application/xml":
                             fdread = fd.read
@@ -803,8 +816,11 @@ def fetch(url, cred, authdata, postlines, xc, tc, dest, timeout, retry_count,
                                 return buf
 
                             fd.read = read
-                            xc.combine(fd)
+                            et = ET.parse(fd)
                             size = s[0]
+
+                            with lock:
+                                xc.combine(et)
 
                         else:
                             msg("getting data from %s failed: unsupported "
@@ -852,6 +868,7 @@ def route(url, cred, authdata, postdata, dest, timeout, retry_count,
     lock = threading.Lock()
     xc = XMLCombiner()
     tc = TextCombiner()
+    nets = set()
 
     if postdata:
         query_url = url.post()
@@ -904,6 +921,7 @@ def route(url, cred, authdata, postdata, dest, timeout, retry_count,
                                                                   xc,
                                                                   tc,
                                                                   dest,
+                                                                  nets,
                                                                   timeout,
                                                                   retry_count,
                                                                   retry_wait,
@@ -942,6 +960,57 @@ def route(url, cred, authdata, postdata, dest, timeout, retry_count,
 
     xc.dump(dest)
     tc.dump(dest)
+
+    return nets
+
+
+def get_citation(nets, options):
+    postdata = ""
+    for (net, year) in nets:
+        postdata += "%s * * * %d-01-01T00:00:00Z %d-12-31T23:59:59Z\n" \
+                    % (net, year, year)
+
+    qp = { 'service': 'station', 'level': 'network', 'format': 'text' }
+    url = RoutingURL(urlparse.urlparse(options.url), qp)
+    dest = io.BytesIO()
+
+    route(url, None, None, postdata, dest, options.timeout,
+          options.retries, options.retry_wait, options.threads,
+          options.verbose)
+
+    dest.seek(0)
+    net_desc = {}
+
+    for line in dest:
+        try:
+            if isinstance(line, bytes):
+                line = line.decode('utf-8')
+
+            (code, desc, start) = line.split('|')[:3]
+
+            if code.startswith('#'):
+                continue
+
+            year = dateutil.parser.parse(start).year
+
+        except (ValueError, UnicodeDecodeError) as e:
+            msg("error parsing text format: %s" % str(e))
+            continue
+
+        if code[0] in '0123456789XYZ':
+            net_desc['%s_%d' % (code, year)] = desc
+
+        else:
+            net_desc[code] = desc
+
+    msg("\nYou received data from the following networks:")
+
+    for code in sorted(net_desc):
+        msg("%s %s" % (code, net_desc[code]))
+
+    msg("\nPlease cite the data in your work according to the following URL:")
+    msg("http://www.fdsn.org/networks/citation/?networks=%s\n"
+        % "+".join(sorted(net_desc)))
 
 
 def main():
@@ -1048,6 +1117,9 @@ def main():
     parser.add_option("-o", "--output-file", type="string",
                       help="file where downloaded data is written")
 
+    parser.add_option("-z", "--no-citation", action="store_true", default=False,
+                      help="suppress network citation info")
+
     (options, args) = parser.parse_args()
 
     if options.help:
@@ -1113,9 +1185,19 @@ def main():
         url = RoutingURL(urlparse.urlparse(options.url), qp)
         dest = open(options.output_file, 'wb')
 
-        route(url, cred, authdata, postdata, dest, options.timeout,
-              options.retries, options.retry_wait, options.threads,
-              options.verbose)
+        nets = route(url, cred, authdata, postdata, dest, options.timeout,
+                     options.retries, options.retry_wait, options.threads,
+                     options.verbose)
+
+        if nets and not options.no_citation:
+              msg("retrieving network citation info", options.verbose)
+              get_citation(nets, options)
+
+        else:
+              msg("", options.verbose)
+
+        msg("In case of problems with your request, please contact "
+            "eida@gfz-potsdam.de\n", options.verbose)
 
     except (IOError, Error) as e:
         msg(str(e))
@@ -1128,7 +1210,3 @@ if __name__ == "__main__":
     __doc__ %= {"prog": sys.argv[0]}
     sys.exit(main())
 
-import obspy
-from future.builtins import *  # NOQA
-VERSION += " (ObsPy %s)" % obspy.__version__
-__doc__ %= {"prog": "obspy-eida-fetch"}
