@@ -97,7 +97,7 @@ except ImportError:
     import urllib.parse as urlparse
     import urllib.parse as urllib
 
-VERSION = "2017.062"
+VERSION = "2017.065"
 
 GET_PARAMS = set(('net', 'network',
                   'sta', 'station',
@@ -1003,13 +1003,17 @@ def get_citation(nets, options):
         else:
             net_desc[code] = desc
 
-    msg("\nYou received data from the following networks:")
+    msg("\nYou received seismic waveform data from the following network(s):")
 
     for code in sorted(net_desc):
         msg("%s %s" % (code, net_desc[code]))
 
-    msg("\nPlease cite the data in your work according to the following URL:")
-    msg("http://www.fdsn.org/networks/citation/?networks=%s\n"
+    msg("\nAcknowledgment is extremely important for network operators\n"
+        "providing open data. When preparing publications, please\n"
+        "cite the data appropriately. The FDSN service at\n\n"
+        "    http://www.fdsn.org/networks/citation/?networks=%s\n\n"
+        "provides a helpful guide based on available network\n"
+        "Digital Object Identifiers.\n"
         % "+".join(sorted(net_desc)))
 
 
@@ -1196,8 +1200,10 @@ def main():
         else:
               msg("", options.verbose)
 
-        msg("In case of problems with your request, please contact "
-            "eida@gfz-potsdam.de\n", options.verbose)
+        msg("In case of problems with your request, plese use the contact "
+            "form at\n\n"
+            "    http://www.orfeus-eu.org/organization/contact/form/\n",
+            options.verbose)
 
     except (IOError, Error) as e:
         msg(str(e))

@@ -20,7 +20,7 @@ import dateutil.parser
 
 from seiscomp import mseedlite, logs
 
-VERSION = "2017.062"
+VERSION = "2017.065"
 
 
 class Error(Exception):
@@ -152,13 +152,18 @@ def get_citation(nets, param, verbose):
         else:
             net_desc[code] = desc
 
-    logs.notice("You received data from the following networks:")
+    logs.notice("You received seismic waveform data from the following "
+                "network(s):")
 
     for code in sorted(net_desc):
         logs.notice("%s %s" % (code, net_desc[code]))
 
-    logs.notice("\nPlease cite the data in your work according to the following URL:")
-    logs.notice("http://www.fdsn.org/networks/citation/?networks=%s\n"
+    logs.notice("\nAcknowledgment is extremely important for network operators\n"
+                "providing open data. When preparing publications, please\n"
+                "cite the data appropriately. The FDSN service at\n\n"
+                "    http://www.fdsn.org/networks/citation/?networks=%s\n\n"
+                "provides a helpful guide based on available network\n"
+                "Digital Object Identifiers.\n"
                 % "+".join(sorted(net_desc)))
 
 
