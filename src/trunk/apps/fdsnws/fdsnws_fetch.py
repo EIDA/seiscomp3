@@ -97,7 +97,7 @@ except ImportError:
     import urllib.parse as urlparse
     import urllib.parse as urllib
 
-VERSION = "2017.065"
+VERSION = "2017.072"
 
 GET_PARAMS = set(('net', 'network',
                   'sta', 'station',
@@ -1202,8 +1202,8 @@ def main():
 
         msg("In case of problems with your request, plese use the contact "
             "form at\n\n"
-            "    http://www.orfeus-eu.org/organization/contact/form/\n",
-            options.verbose)
+            "    http://www.orfeus-eu.org/organization/contact/form/"
+            "?recipient=EIDA\n", options.verbose)
 
     except (IOError, Error) as e:
         msg(str(e))
